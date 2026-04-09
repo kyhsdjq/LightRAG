@@ -168,6 +168,7 @@ async def _handle_entity_relation_summary(
     description_list: list[str],
     separator: str,
     global_config: dict,
+    merge_preference: str = "default",
     llm_response_cache: BaseKVStorage | None = None,
 ) -> tuple[str, bool]:
     """Handle entity relation description summary using map-reduce approach.
@@ -212,8 +213,12 @@ async def _handle_entity_relation_summary(
 
         # If total length is within limits, perform final summarization
         if total_tokens <= summary_context_size or len(current_list) <= 2:
+            force_newest_first_llm_merge = (
+                merge_preference == "newest_first" and len(current_list) > 1
+            )
             if (
-                len(current_list) < force_llm_summary_on_merge
+                not force_newest_first_llm_merge
+                and len(current_list) < force_llm_summary_on_merge
                 and total_tokens < summary_max_tokens
             ):
                 # no LLM needed, just join the descriptions
@@ -230,6 +235,7 @@ async def _handle_entity_relation_summary(
                     entity_or_relation_name,
                     current_list,
                     global_config,
+                    merge_preference,
                     llm_response_cache,
                 )
                 return final_summary, True  # LLM was used for final summarization
@@ -285,6 +291,7 @@ async def _handle_entity_relation_summary(
                     entity_or_relation_name,
                     chunk,
                     global_config,
+                    merge_preference,
                     llm_response_cache,
                 )
                 new_summaries.append(summary)
@@ -299,6 +306,7 @@ async def _summarize_descriptions(
     description_name: str,
     description_list: list[str],
     global_config: dict,
+    merge_preference: str = "default",
     llm_response_cache: BaseKVStorage | None = None,
 ) -> str:
     """Helper function to summarize a list of descriptions using LLM.
@@ -320,7 +328,12 @@ async def _summarize_descriptions(
 
     summary_length_recommended = global_config["summary_length_recommended"]
 
-    prompt_template = PROMPTS["summarize_entity_descriptions"]
+    prompt_key = (
+        "summarize_entity_descriptions_newest_first"
+        if merge_preference == "newest_first"
+        else "summarize_entity_descriptions"
+    )
+    prompt_template = PROMPTS[prompt_key]
 
     # Convert descriptions to JSONL format and apply token-based truncation
     tokenizer = global_config["tokenizer"]
@@ -1616,6 +1629,7 @@ async def _merge_nodes_then_upsert(
     knowledge_graph_inst: BaseGraphStorage,
     entity_vdb: BaseVectorStorage | None,
     global_config: dict,
+    merge_preference: str = "default",
     pipeline_status: dict = None,
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
@@ -1754,15 +1768,22 @@ async def _merge_nodes_then_upsert(
         if desc not in unique_nodes:
             unique_nodes[desc] = dp
 
-    # Sort description by timestamp, then by description length when timestamps are the same
-    sorted_nodes = sorted(
-        unique_nodes.values(),
-        key=lambda x: (x.get("timestamp", 0), -len(x.get("description", ""))),
-    )
+    if merge_preference == "newest_first":
+        sorted_nodes = sorted(
+            unique_nodes.values(),
+            key=lambda x: (-x.get("timestamp", 0), -len(x.get("description", ""))),
+        )
+    else:
+        sorted_nodes = sorted(
+            unique_nodes.values(),
+            key=lambda x: (x.get("timestamp", 0), -len(x.get("description", ""))),
+        )
     sorted_descriptions = [dp["description"] for dp in sorted_nodes]
 
-    # Combine already_description with sorted new sorted descriptions
-    description_list = already_description + sorted_descriptions
+    if merge_preference == "newest_first":
+        description_list = sorted_descriptions + already_description
+    else:
+        description_list = already_description + sorted_descriptions
     if not description_list:
         fallback_description = f"Entity {entity_name}"
         logger.warning(
@@ -1783,6 +1804,7 @@ async def _merge_nodes_then_upsert(
         description_list,
         GRAPH_FIELD_SEP,
         global_config,
+        merge_preference,
         llm_response_cache,
     )
 
@@ -1923,6 +1945,7 @@ async def _merge_edges_then_upsert(
     relationships_vdb: BaseVectorStorage | None,
     entity_vdb: BaseVectorStorage | None,
     global_config: dict,
+    merge_preference: str = "default",
     pipeline_status: dict = None,
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
@@ -2084,15 +2107,22 @@ async def _merge_edges_then_upsert(
         if description_value not in unique_edges:
             unique_edges[description_value] = dp
 
-    # Sort description by timestamp, then by description length (largest to smallest) when timestamps are the same
-    sorted_edges = sorted(
-        unique_edges.values(),
-        key=lambda x: (x.get("timestamp", 0), -len(x.get("description", ""))),
-    )
+    if merge_preference == "newest_first":
+        sorted_edges = sorted(
+            unique_edges.values(),
+            key=lambda x: (-x.get("timestamp", 0), -len(x.get("description", ""))),
+        )
+    else:
+        sorted_edges = sorted(
+            unique_edges.values(),
+            key=lambda x: (x.get("timestamp", 0), -len(x.get("description", ""))),
+        )
     sorted_descriptions = [dp["description"] for dp in sorted_edges]
 
-    # Combine already_description with sorted new descriptions
-    description_list = already_description + sorted_descriptions
+    if merge_preference == "newest_first":
+        description_list = sorted_descriptions + already_description
+    else:
+        description_list = already_description + sorted_descriptions
     if not description_list:
         logger.error(f"Relation {src_id}~{tgt_id} has no description")
         raise ValueError(f"Relation {src_id}~{tgt_id} has no description")
@@ -2112,6 +2142,7 @@ async def _merge_edges_then_upsert(
         description_list,
         GRAPH_FIELD_SEP,
         global_config,
+        merge_preference,
         llm_response_cache,
     )
 
@@ -2446,6 +2477,7 @@ async def merge_nodes_and_edges(
     entity_vdb: BaseVectorStorage,
     relationships_vdb: BaseVectorStorage,
     global_config: dict[str, str],
+    merge_preference: str = "default",
     full_entities_storage: BaseKVStorage = None,
     full_relations_storage: BaseKVStorage = None,
     doc_id: str = None,
@@ -2547,6 +2579,7 @@ async def merge_nodes_and_edges(
                         knowledge_graph_inst,
                         entity_vdb,
                         global_config,
+                        merge_preference,
                         pipeline_status,
                         pipeline_status_lock,
                         llm_response_cache,
@@ -2656,6 +2689,7 @@ async def merge_nodes_and_edges(
                         relationships_vdb,
                         entity_vdb,
                         global_config,
+                        merge_preference,
                         pipeline_status,
                         pipeline_status_lock,
                         llm_response_cache,

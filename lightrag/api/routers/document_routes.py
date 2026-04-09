@@ -84,8 +84,6 @@ router = APIRouter(
 temp_prefix = "__tmp__"
 UNKNOWN_FILE_SOURCE = "unknown_source"
 LEGACY_EMPTY_FILE_PATH_SENTINELS = {"", "no-file-path"}
-
-
 def normalize_file_path(file_path: str | None) -> str:
     """Normalize missing document sources to a single non-null sentinel."""
     if file_path is None:
@@ -251,6 +249,18 @@ class InsertTextRequest(BaseModel):
             "example": {
                 "text": "This is a sample text to be inserted into the RAG system.",
                 "file_source": "Source of the text (optional)",
+            }
+        }
+
+
+class OverwriteInsertTextRequest(InsertTextRequest):
+    """Request model for overwrite-style single text ingestion."""
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "text": "This is replacement text to be inserted into the RAG system.",
+                "file_source": "https://example.com/page",
             }
         }
 
@@ -1728,6 +1738,7 @@ async def pipeline_index_texts(
     texts: List[str],
     file_sources: List[str] = None,
     track_id: str = None,
+    document_metadata: Optional[dict[str, Any]] = None,
 ):
     """Index a list of texts with track_id
 
@@ -1753,9 +1764,63 @@ async def pipeline_index_texts(
             )
 
     await rag.apipeline_enqueue_documents(
-        input=texts, file_paths=normalized_file_sources, track_id=track_id
+        input=texts,
+        file_paths=normalized_file_sources,
+        track_id=track_id,
+        metadata=document_metadata,
     )
     await rag.apipeline_process_enqueue_documents()
+
+
+async def enqueue_single_text_document(
+    rag: LightRAG,
+    background_tasks: BackgroundTasks,
+    *,
+    text: str,
+    file_source: str,
+    track_prefix: str,
+    success_message: str,
+    document_metadata: Optional[dict[str, Any]] = None,
+) -> InsertResponse:
+    """Queue a single text document after duplicate checks."""
+    if file_source and file_source.strip() and file_source != UNKNOWN_FILE_SOURCE:
+        existing_doc_data = await rag.doc_status.get_doc_by_file_path(file_source)
+        if existing_doc_data:
+            status = existing_doc_data.get("status", "unknown")
+            existing_track_id = existing_doc_data.get("track_id") or ""
+            return InsertResponse(
+                status="duplicated",
+                message=f"File source '{file_source}' already exists in document storage (Status: {status}).",
+                track_id=existing_track_id,
+            )
+
+    sanitized_text = sanitize_text_for_encoding(text)
+    content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
+    existing_doc = await rag.doc_status.get_by_id(content_doc_id)
+    if existing_doc:
+        status = existing_doc.get("status", "unknown")
+        existing_track_id = existing_doc.get("track_id") or ""
+        return InsertResponse(
+            status="duplicated",
+            message=f"Identical content already exists in document storage (doc_id: {content_doc_id}, Status: {status}).",
+            track_id=existing_track_id,
+        )
+
+    track_id = generate_track_id(track_prefix)
+    background_tasks.add_task(
+        pipeline_index_texts,
+        rag,
+        [text],
+        file_sources=[file_source],
+        track_id=track_id,
+        document_metadata=document_metadata,
+    )
+
+    return InsertResponse(
+        status="success",
+        message=success_message,
+        track_id=track_id,
+    )
 
 
 async def run_scanning_process(
@@ -2289,58 +2354,56 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
-            # Check if file_source already exists in doc_status storage
-            if (
-                request.file_source
-                and request.file_source.strip()
-                and request.file_source != "unknown_source"
-            ):
-                existing_doc_data = await rag.doc_status.get_doc_by_file_path(
-                    request.file_source
-                )
-                if existing_doc_data:
-                    # Get document status and track_id from existing document
-                    status = existing_doc_data.get("status", "unknown")
-                    # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
-                    existing_track_id = existing_doc_data.get("track_id") or ""
-                    return InsertResponse(
-                        status="duplicated",
-                        message=f"File source '{request.file_source}' already exists in document storage (Status: {status}).",
-                        track_id=existing_track_id,
-                    )
-
-            # Check if content already exists by computing content hash (doc_id)
-            sanitized_text = sanitize_text_for_encoding(request.text)
-            content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
-            existing_doc = await rag.doc_status.get_by_id(content_doc_id)
-            if existing_doc:
-                # Content already exists, return duplicated with existing track_id
-                status = existing_doc.get("status", "unknown")
-                existing_track_id = existing_doc.get("track_id") or ""
-                return InsertResponse(
-                    status="duplicated",
-                    message=f"Identical content already exists in document storage (doc_id: {content_doc_id}, Status: {status}).",
-                    track_id=existing_track_id,
-                )
-
-            # Generate track_id for text insertion
-            track_id = generate_track_id("insert")
-
-            background_tasks.add_task(
-                pipeline_index_texts,
+            return await enqueue_single_text_document(
                 rag,
-                [request.text],
-                file_sources=[request.file_source],
-                track_id=track_id,
-            )
-
-            return InsertResponse(
-                status="success",
-                message="Text successfully received. Processing will continue in background.",
-                track_id=track_id,
+                background_tasks,
+                text=request.text,
+                file_source=request.file_source,
+                track_prefix="insert",
+                success_message="Text successfully received. Processing will continue in background.",
             )
         except Exception as e:
             logger.error(f"Error /documents/text: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/text/overwrite",
+        response_model=InsertResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def overwrite_text(
+        request: OverwriteInsertTextRequest, background_tasks: BackgroundTasks
+    ):
+        """
+        Insert text through the overwrite-add flow used for changed-document updates.
+
+        This endpoint intentionally reuses the normal text-ingest behavior as much
+        as possible. The MCP layer is responsible for delete-then-reinsert; the
+        overwrite route only marks the newly queued document so merge summarization
+        can prefer newest-first ordering during graph updates.
+        """
+        try:
+            normalized_file_source = normalize_file_path(request.file_source)
+            if normalized_file_source == UNKNOWN_FILE_SOURCE:
+                raise HTTPException(
+                    status_code=400,
+                    detail="file_source is required for overwrite text insertion",
+                )
+
+            return await enqueue_single_text_document(
+                rag,
+                background_tasks,
+                text=request.text,
+                file_source=normalized_file_source,
+                track_prefix="overwrite",
+                success_message="Text successfully received through overwrite-add. Processing will continue in background.",
+                document_metadata={"merge_preference": "newest_first"},
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error /documents/text/overwrite: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 

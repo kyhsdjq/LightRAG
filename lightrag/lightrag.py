@@ -1290,6 +1290,7 @@ class LightRAG:
         ids: list[str] | None = None,
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
+        metadata: dict[str, Any] | list[dict[str, Any] | None] | None = None,
     ) -> str:
         """
         Pipeline for Processing Documents
@@ -1317,6 +1318,8 @@ class LightRAG:
             ids = [ids]
         if isinstance(file_paths, str):
             file_paths = [file_paths]
+        if isinstance(metadata, dict):
+            metadata = [dict(metadata) for _ in input]
 
         # If file_paths is provided, ensure it matches the number of documents
         if file_paths is not None:
@@ -1334,6 +1337,13 @@ class LightRAG:
             # If no file paths provided, use placeholder
             file_paths = ["unknown_source"] * len(input)
 
+        if metadata is not None:
+            if len(metadata) != len(input):
+                raise ValueError("Number of metadata entries must match the number of documents")
+            metadata = [item or {} for item in metadata]
+        else:
+            metadata = [{} for _ in input]
+
         # 1. Validate ids if provided or generate MD5 hash IDs and remove duplicate contents
         if ids is not None:
             # Check if the number of IDs matches the number of documents
@@ -1346,31 +1356,36 @@ class LightRAG:
 
             # Generate contents dict and remove duplicates in one pass
             unique_contents = {}
-            for id_, doc, path in zip(ids, input, file_paths):
+            for id_, doc, path, doc_metadata in zip(ids, input, file_paths, metadata):
                 cleaned_content = sanitize_text_for_encoding(doc)
                 if cleaned_content not in unique_contents:
-                    unique_contents[cleaned_content] = (id_, path)
+                    unique_contents[cleaned_content] = (id_, path, doc_metadata)
 
             # Reconstruct contents with unique content
             contents = {
-                id_: {"content": content, "file_path": file_path}
-                for content, (id_, file_path) in unique_contents.items()
+                id_: {
+                    "content": content,
+                    "file_path": file_path,
+                    "metadata": dict(doc_metadata),
+                }
+                for content, (id_, file_path, doc_metadata) in unique_contents.items()
             }
         else:
             # Clean input text and remove duplicates in one pass
             unique_content_with_paths = {}
-            for doc, path in zip(input, file_paths):
+            for doc, path, doc_metadata in zip(input, file_paths, metadata):
                 cleaned_content = sanitize_text_for_encoding(doc)
                 if cleaned_content not in unique_content_with_paths:
-                    unique_content_with_paths[cleaned_content] = path
+                    unique_content_with_paths[cleaned_content] = (path, doc_metadata)
 
             # Generate contents dict of MD5 hash IDs and documents with paths
             contents = {
                 compute_mdhash_id(content, prefix="doc-"): {
                     "content": content,
                     "file_path": path,
+                    "metadata": dict(doc_metadata),
                 }
-                for content, path in unique_content_with_paths.items()
+                for content, (path, doc_metadata) in unique_content_with_paths.items()
             }
 
         # 2. Generate document initial status (without content)
@@ -1385,6 +1400,7 @@ class LightRAG:
                     "file_path"
                 ],  # Store file path in document status
                 "track_id": track_id,  # Store track_id in document status
+                "metadata": dict(content_data.get("metadata", {})),
             }
             for id_, content_data in contents.items()
         }
@@ -1659,7 +1675,7 @@ class LightRAG:
                         "track_id": getattr(status_doc, "track_id", ""),
                         # Clear any error messages and processing metadata
                         "error_msg": "",
-                        "metadata": {},
+                        "metadata": dict(getattr(status_doc, "metadata", {}) or {}),
                     }
 
                     # Update the status in to_process_docs as well
@@ -1954,6 +1970,7 @@ class LightRAG:
                                             "file_path": file_path,
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
                                             "metadata": {
+                                                **(status_doc.metadata or {}),
                                                 "processing_start_time": processing_start_time
                                             },
                                         }
@@ -2078,6 +2095,9 @@ class LightRAG:
                                     entity_vdb=self.entities_vdb,
                                     relationships_vdb=self.relationships_vdb,
                                     global_config=asdict(self),
+                                    merge_preference=(status_doc.metadata or {}).get(
+                                        "merge_preference", "default"
+                                    ),
                                     full_entities_storage=self.full_entities,
                                     full_relations_storage=self.full_relations,
                                     doc_id=doc_id,
@@ -2109,6 +2129,7 @@ class LightRAG:
                                             "file_path": file_path,
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
                                             "metadata": {
+                                                **(status_doc.metadata or {}),
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
                                             },
@@ -2182,6 +2203,7 @@ class LightRAG:
                                             "file_path": file_path,
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
                                             "metadata": {
+                                                **(status_doc.metadata or {}),
                                                 "processing_start_time": processing_start_time,
                                                 "processing_end_time": processing_end_time,
                                             },
